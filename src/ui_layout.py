@@ -30,6 +30,9 @@ def build_window(app):
     root.title("网络嗅探器 · 实验 1A")
     root.geometry("1100x740")
     root.minsize(760, 550)
+    if root.tk.call("tk", "windowingsystem") == "win32" and (
+            root.winfo_screenwidth() < 1100 or root.winfo_screenheight() <= 800):
+        root.state("zoomed")
     body = ttk.Frame(root, padding=(14, 12))
     body.pack(fill="both", expand=True)
     body.columnconfigure(0, weight=1)

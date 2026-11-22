@@ -22,7 +22,8 @@ from ui_layout import build_window
 
 PACKET_LIMIT = 5000
 BYTE_LIMIT = 64 * 1024 * 1024
-SAMPLE_PATH = Path(__file__).resolve().parents[1] / "验收样例" / "本机回环.pcap"
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
+SAMPLE_PATH = RESOURCE_DIR / "验收样例" / "本机回环.pcap"
 
 
 def _is_loopback(name: str) -> bool:
@@ -116,13 +117,10 @@ class SnifferApp:
         self.source_box.configure(values=tuple(self.sources))
         selected = next((label for label, name in self.sources.items() if name == previous_name),
                         next(iter(self.sources), ""))
-        self.source_name.set(selected)
-        if notice:
-            self.status_var.set(f"网卡枚举提示：{notice}")
-        elif self.sources:
-            self.status_var.set("就绪。选择接口开始抓包，或打开已有的 PCAP 文件。")
-        else:
-            self.status_var.set("未找到抓包接口。可刷新接口或打开已有的 PCAP 文件。")
+        self.source_name.set(selected or "仅离线 · 刷新接口")
+        self.interface_notice = "" if self.sources else (
+            notice or "未找到抓包接口。请确认网卡已启用，再刷新接口。")
+        self.status_var.set(self.interface_notice or "就绪。选择接口开始抓包，或打开已有的 PCAP 文件。")
         self._buttons()
 
     def _reset_session(self):
@@ -295,7 +293,7 @@ class SnifferApp:
                 sampler = threading.Thread(target=sample_owners, daemon=True, name="tcp-owners")
                 sampler.start()
             try:
-                source(stop, received)
+                result = source(stop, received)
                 if offline and (limit_message or not stop.is_set()):
                     put(("loaded", (mode, source_name, pending)), final=True)
                 if limit_message:
@@ -304,6 +302,10 @@ class SnifferApp:
                     message = "已取消读取" if offline else "已停止采集"
                 else:
                     message = f"{mode}完成 · {count:,} 包"
+                    if result:
+                        message += f" · {result}"
+                    if offline and self.interface_notice:
+                        message += f" · {self.interface_notice}"
             except Exception as exc:
                 message = f"{'打开失败' if offline else '采集失败'} · {exc}"
             finally:
@@ -585,6 +587,6 @@ if __name__ == "__main__":
     app = SnifferApp(window)
     if len(sys.argv) == 2 and sys.argv[1] != "--sample":
         window.after_idle(app.open_capture, sys.argv[1])
-    elif SAMPLE_PATH.is_file():
+    else:
         window.after_idle(app.open_sample)
     window.mainloop()

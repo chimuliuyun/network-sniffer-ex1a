@@ -1,5 +1,6 @@
 import ctypes as C
 import io
+import os
 import struct
 import sys
 import unittest
@@ -85,6 +86,44 @@ class ClassicPcapTests(unittest.TestCase):
 
 
 class LiveApiTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows Npcap DLL layout")
+    def test_missing_npcap_can_be_retried_in_the_system_directory(self):
+        capture._library.cache_clear()
+        self.addCleanup(capture._library.cache_clear)
+        with TemporaryDirectory() as folder, patch.dict(os.environ, {"SystemRoot": folder}):
+            with self.assertRaisesRegex(capture.CaptureError, "安装 Npcap"):
+                capture.list_interfaces()
+            dll = Path(folder) / "System32" / "Npcap" / "wpcap.dll"
+            dll.parent.mkdir(parents=True)
+            dll.touch()
+            with patch.object(C, "CDLL") as load:
+                load.side_effect = C.WinError(193)
+                with self.assertRaisesRegex(capture.CaptureError, "架构"):
+                    capture.list_interfaces()
+                load.assert_called_once_with(str(dll))
+                load.side_effect = None
+                self.assertIs(capture._library(), load.return_value)
+
+    @unittest.skipUnless(os.name == "nt", "Windows driver diagnostics")
+    @patch("capture._library")
+    def test_driver_error_and_access_denied_preserve_npcap_messages(self, library):
+        def fail_list(head, error):
+            error.value = b"driver unavailable"
+            return -1
+
+        def fail_open(device, size, promisc, timeout, error):
+            error.value = b"Access is denied. (5)"
+            return None
+
+        api = library.return_value
+        api.pcap_findalldevs.side_effect = fail_list
+        with self.assertRaisesRegex(capture.CaptureError, "driver unavailable.*sc.exe query npcap"):
+            capture.list_interfaces()
+        api.pcap_open_live.side_effect = fail_open
+        with self.assertRaisesRegex(capture.CaptureError, "Access is denied.*管理员"):
+            capture.capture_live("adapter", Event(), Mock())
+        api.pcap_close.assert_not_called()
+
     @patch("capture._library")
     def test_passive_mode_callback_and_close(self, library):
         api = library.return_value

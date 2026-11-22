@@ -5,6 +5,7 @@ import ctypes.util
 import math
 import os
 import struct
+import sysconfig
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -72,12 +73,28 @@ def _decode(data: bytes | None) -> str:
         return data.decode("mbcs" if os.name == "nt" else "utf-8", "replace")
 
 
+def _interface_error(action: str, detail: bytes) -> CaptureError:
+    reason = _decode(detail)
+    message = f"{action}（{reason}）" if reason else action
+    if os.name == "nt":
+        denied = ("denied", "permission", "拒绝访问", "访问被拒绝", "(5)", "(0x00000005)")
+        if any(term in reason.casefold() for term in denied):
+            message += "。请确认 Npcap 的权限设置。启用“仅管理员”时需以管理员身份运行。"
+        else:
+            message += "。请确认网卡已启用，用 sc.exe query npcap 检查驱动状态后刷新接口。"
+    return CaptureError(message)
+
+
 @lru_cache(maxsize=1)
 def _library():
     if os.name == "nt":
-        path = Path(os.environ["SystemRoot"]) / "System32" / "Npcap" / "wpcap.dll"
+        windows = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+        if not windows:
+            raise CaptureError("缺少 Windows 系统目录环境变量 SystemRoot 或 WINDIR，请从资源管理器重新启动程序。")
+        # WOW64 redirects System32 to the DLLs for the current process architecture.
+        path = Path(windows) / "System32" / "Npcap" / "wpcap.dll"
         if not path.is_file():
-            raise CaptureError("未找到 Npcap 驱动库。请安装 Npcap 后刷新网卡列表。")
+            raise CaptureError("未找到 Npcap 运行库。请从 npcap.com 安装 Npcap 后刷新接口。")
     else:
         path = ctypes.util.find_library("pcap")
         if not path:
@@ -85,6 +102,12 @@ def _library():
     try:
         lib = C.CDLL(str(path))
     except OSError as exc:
+        if os.name == "nt":
+            if getattr(exc, "winerror", None) == 193:
+                hint = f"本程序使用 {sysconfig.get_platform()}，请选择与 Npcap DLL 架构一致的运行版本。"
+            else:
+                hint = "请修复或重新安装 Npcap，确认其运行库和依赖完整。"
+            raise CaptureError(f"无法加载 Npcap（{exc}）。{hint}") from exc
         raise CaptureError(f"无法加载抓包运行库（{exc}）") from exc
     handle = C.c_void_p
     text = C.c_char_p
@@ -113,7 +136,7 @@ def list_interfaces() -> list[Interface]:
     head = _DevicePtr()
     error = C.create_string_buffer(256)
     if lib.pcap_findalldevs(C.byref(head), error) != 0:
-        raise CaptureError(f"无法列出网卡（{_decode(error.value)}）")
+        raise _interface_error("无法列出网卡", error.value)
     interfaces = []
     try:
         current = head
@@ -137,7 +160,7 @@ def capture_live(interface_name: str, stop: Event, on_packet: PacketCallback, *,
     error = C.create_string_buffer(256)
     handle = lib.pcap_open_live(os.fsencode(interface_name), _SNAPLEN, 0, 50, error)
     if not handle:
-        raise CaptureError(f"无法打开网卡（{_decode(error.value)}）")
+        raise _interface_error("无法打开网卡", error.value)
     try:
         if capture_filter:
             program = _BpfProgram()

@@ -1,6 +1,7 @@
 """在回环网卡上产生可识别的 HTTP、UDP 和 ICMP 流量，供抓包验收。"""
 
 from contextlib import ExitStack
+import errno
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
@@ -56,6 +57,30 @@ def _open_endpoints(resources, family, host):
                      bound_socket(socket.SOCK_DGRAM), bound_socket(socket.SOCK_DGRAM))
 
 
+def _available_endpoints(resources):
+    endpoints = {}
+    for family, host in _HOSTS:
+        with ExitStack() as pending:
+            try:
+                endpoints[host] = _open_endpoints(pending, family, host)
+            except OSError as exc:
+                if exc.errno not in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EADDRNOTAVAIL):
+                    raise
+                continue
+            resources.enter_context(pending.pop_all())
+    if not endpoints:
+        raise CaptureError("IPv4 和 IPv6 回环地址均不可用。")
+    return endpoints
+
+
+def _stack_result(endpoints):
+    if len(endpoints) == 2:
+        return "IPv4、IPv6 均已验证"
+    if "127.0.0.1" in endpoints:
+        return "已验证 IPv4，IPv6 回环不可用"
+    return "已验证 IPv6，IPv4 回环不可用"
+
+
 def _exchange(host, endpoints, stop):
     server, outgoing, receiver, sender = endpoints
     outgoing.connect(server.server_address)
@@ -91,21 +116,22 @@ def exchange(family, host):
         return _exchange(host, _open_endpoints(resources, family, host), Event())
 
 
-def _marked_pings(marker: bytes, stop: Event):
+def _marked_pings(marker: bytes, stop: Event, hosts):
     """每次实测使用独立的 Echo 载荷，避免把其他程序的 ping 纳入本次结果。"""
     if os.name == "nt":
         executable = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        addresses = ",".join(f"'{host}'" for host in hosts)
         script = (
             "$ErrorActionPreference='Stop'; $p=New-Object Net.NetworkInformation.Ping; "
-            f"$b=[Text.Encoding]::ASCII.GetBytes('{marker.decode('ascii')}'); "
-            "try {foreach ($hostIP in '127.0.0.1','::1') {"
+            f"$b=[Text.Encoding]::ASCII.GetBytes('{marker.decode('ascii')}'); $targets=@({addresses}); "
+            "try {foreach ($hostIP in $targets) {"
             "if ($p.Send([Net.IPAddress]::Parse($hostIP),1000,$b).Status -ne 'Success'){exit 1}"
             "}}finally{$p.Dispose()}"
         )
         commands = [[str(executable), "-NoProfile", "-NonInteractive", "-Command", script]]
     else:
-        commands = [["ping", version, "-c", "1", "-s", "64", "-p", marker.hex(), host]
-                    for version, host in (("-4", "127.0.0.1"), ("-6", "::1"))]
+        commands = [["ping", "-6" if host == "::1" else "-4", "-c", "1", "-s", "64", "-p", marker.hex(), host]
+                    for host in hosts]
     for command in commands:
         if stop.is_set():
             return
@@ -121,7 +147,7 @@ def _marked_pings(marker: bytes, stop: Event):
                 raise CaptureError("本机 ICMP 回显测试未成功。")
 
 
-def capture_demo(interface_name: str, stop: Event, on_packet: PacketCallback) -> None:
+def capture_demo(interface_name: str, stop: Event, on_packet: PacketCallback) -> str | None:
     """仅采集本轮在回环接口生成的流量，完成后自动关闭抓包句柄。"""
     if stop.is_set():
         return
@@ -130,17 +156,21 @@ def capture_demo(interface_name: str, stop: Event, on_packet: PacketCallback) ->
     marker = secrets.token_hex(8).encode("ascii")
     ready, finish, complete = Event(), Event(), Event()
     failure = []
-    observed = {host: set() for _, host in _HOSTS}
     with ExitStack() as resources:
-        endpoints = {host: _open_endpoints(resources, family, host) for family, host in _HOSTS}
+        endpoints = _available_endpoints(resources)
+        observed = {host: set() for host in endpoints}
+        expected = {}
         clauses = []
         for host, channel in endpoints.items():
             tcp = f"(tcp and port {channel.server.server_port} and port {channel.client.getsockname()[1]})"
             udp = f"(udp and port {channel.receiver.getsockname()[1]} and port {channel.sender.getsockname()[1]})"
             if host == "127.0.0.1":
                 echo, header, offset = "icmp and (icmp[0] = 0 or icmp[0] = 8)", "icmp", 8
+                echo_types = {"0", "8"}
             else:
                 echo, header, offset = "icmp6 and (ip6[40] = 128 or ip6[40] = 129)", "ip6", 48
+                echo_types = {"128", "129"}
+            expected[host] = {"GET", "200", "udp-in", "udp-out"} | echo_types
             if os.name == "nt":  # Ping.Send places the marker directly after its ICMP header.
                 for pos in range(0, len(marker), 4):
                     echo += f" and {header}[{offset + pos}:4] = 0x{marker[pos:pos + 4].hex()}"
@@ -161,8 +191,7 @@ def capture_demo(interface_name: str, stop: Event, on_packet: PacketCallback) ->
                 receiver_port = endpoints[packet.src].receiver.getsockname()[1]
                 seen.add("udp-in" if packet.dport == receiver_port else "udp-out")
             on_packet(ts, link, data, size)
-            if ({"GET", "200", "udp-in", "udp-out", "0", "8"} <= observed["127.0.0.1"]
-                    and {"GET", "200", "udp-in", "udp-out", "128", "129"} <= observed["::1"]):
+            if all(required <= observed[host] for host, required in expected.items()):
                 complete.set()
 
         def read():
@@ -185,31 +214,37 @@ def capture_demo(interface_name: str, stop: Event, on_packet: PacketCallback) ->
                 if stop.is_set():
                     return
                 _exchange(host, test_sockets, stop)
-            _marked_pings(marker, stop)
+            _marked_pings(marker, stop, endpoints.keys())
             deadline = monotonic() + 2
             while not stop.is_set() and not complete.wait(0.05):
                 if failure:
                     raise failure[0]
                 if monotonic() >= deadline:
-                    raise CaptureError("回环实测未捕获完整的双栈 HTTP、UDP 和 ICMP 往返，请重新运行。")
+                    missing = "、".join(host for host in endpoints if not expected[host] <= observed[host])
+                    raise CaptureError(f"{missing} 未捕获完整的 HTTP、UDP 和 ICMP 往返，请重新运行。")
         finally:
             finish.set()
             reader.join()
         if failure and not stop.is_set():
             raise failure[0]
+        if not stop.is_set():
+            return _stack_result(endpoints)
 
 
 def main():
     print(f"本机测试流量的进程 PID 为 {os.getpid()}", flush=True)
-    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
-        http_port, udp_port = exchange(family, host)
-        print(f"{host}  HTTP GET /experiment-1a → 200，TCP 端口 {http_port}；UDP 双向回显，端口 {udp_port}")
-        count, size = ("-n", "-l") if os.name == "nt" else ("-c", "-s")
-        result = subprocess.run(["ping", "-6" if family == socket.AF_INET6 else "-4",
-                                 count, "1", size, "89", host], capture_output=True, timeout=6)
-        print(f"{host}  ICMP 回显{'成功' if result.returncode == 0 else '未收到回复'}")
-        if result.returncode:
-            raise SystemExit(result.returncode)
+    with ExitStack() as resources:
+        endpoints = _available_endpoints(resources)
+        for host, channel in endpoints.items():
+            http_port, udp_port = _exchange(host, channel, Event())
+            print(f"{host}  HTTP GET /experiment-1a → 200，TCP 端口 {http_port}；UDP 双向回显，端口 {udp_port}")
+            count, size = ("-n", "-l") if os.name == "nt" else ("-c", "-s")
+            result = subprocess.run(["ping", "-6" if host == "::1" else "-4",
+                                     count, "1", size, "89", host], capture_output=True, timeout=6)
+            print(f"{host}  ICMP 回显{'成功' if result.returncode == 0 else '未收到回复'}")
+            if result.returncode:
+                raise SystemExit(result.returncode)
+        print(_stack_result(endpoints))
 
 
 if __name__ == "__main__":

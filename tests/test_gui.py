@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from capture import CaptureError, Interface
 from gui import SAMPLE_PATH, SnifferApp
 
 
@@ -53,6 +54,22 @@ class InspectorTests(unittest.TestCase):
         app.inspect_flow_packet()
         self.assertEqual(app.packet_tree.selection(), (item,))
         self.assertEqual(app.notebook.index("current"), 0)
+
+    def test_offline_sample_keeps_driver_hint_until_refresh(self):
+        app = self.app
+        with patch("gui.list_interfaces", side_effect=CaptureError("未找到 Npcap 运行库")):
+            app.refresh_interfaces()
+        app.open_sample()
+        self.finish_read()
+        self.assertIn("34 包", app.status_var.get())
+        self.assertIn("Npcap", app.status_var.get())
+        self.assertTrue(app.start_button.instate(["disabled"]))
+        adapter = Interface(r"\Device\NPF_Loopback", "Adapter for loopback capture")
+        with patch("gui.list_interfaces", return_value=[adapter]):
+            app.refresh_interfaces()
+        self.assertEqual(app.interface_notice, "")
+        self.assertFalse(app.demo_button.instate(["disabled"]))
+        self.assertEqual(len(app.records), 34)
 
     def test_export_preserves_full_capture_and_failed_open_preserves_session(self):
         app = self.app

@@ -1,8 +1,14 @@
 @echo off
-where pythonw.exe >nul 2>nul
-if not errorlevel 1 (
-    start "" pythonw.exe -B "%~dp0src\gui.py" %*
+setlocal DisableDelayedExpansion
+chcp 65001 >nul
+call "%~dp0src\find_python.cmd"
+if errorlevel 1 goto failed
+if defined PY_GUI (
+    start "" "%PY_GUI%" %PY_ARGS% -B -X utf8 "%~dp0src\gui.py" %*
     exit /b
 )
-python -B "%~dp0src\gui.py" %*
-if errorlevel 1 pause
+"%PY_EXE%" %PY_ARGS% -B -X utf8 "%~dp0src\gui.py" %*
+if not errorlevel 1 exit /b 0
+:failed
+pause
+exit /b 1
