@@ -72,10 +72,7 @@ class SnifferApp:
         self.query_var = tk.StringVar(root)
         self.mode_var = tk.StringVar(root, "就绪")
         self.session_var = tk.StringVar(root, "等待开始采集")
-        self.total_var = tk.StringVar(root)
-        self.visible_var = tk.StringVar(root)
-        self.streams_var = tk.StringVar(root)
-        self.bytes_var = tk.StringVar(root)
+        self.count_var = tk.StringVar(root)
         self.selected_var = tk.StringVar(root)
         self.flow_choice_var = tk.StringVar(root)
         self.filter_timer = None
@@ -157,10 +154,8 @@ class SnifferApp:
         self._counts()
 
     def _counts(self):
-        self.total_var.set(f"{len(self.packets):,}")
-        self.visible_var.set(f"{self.displayed:,}")
-        self.streams_var.set(f"{len(self.tracker.flows):,}")
-        self.bytes_var.set(_format_size(self.wire_bytes))
+        self.count_var.set(f"已记录 {len(self.packets):,} 包　显示 {self.displayed:,} 包　"
+                           f"TCP 流 {len(self.tracker.flows):,} 条　总线长 {_format_size(self.wire_bytes)}")
         if self.displayed:
             self.empty_panel.place_forget()
         else:
