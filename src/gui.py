@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
+import time
 import tkinter as tk
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, ttk
 
 from capture import CaptureError, capture_live, list_interfaces, read_pcap
+from owners import read_tcp_owners
 from protocols import FlowTracker, Packet, parse_packet
 
 
@@ -69,6 +73,8 @@ class SnifferApp:
         self.status_var = tk.StringVar(root)
         self.count_var = tk.StringVar(root)
         self.flow_var = tk.StringVar(root)
+        self.pid_var = tk.StringVar(root)
+        self.process_note = tk.StringVar(root)
         self._build()
         self._reset_session()
         self.refresh_interfaces()
@@ -135,9 +141,27 @@ class SnifferApp:
             ("length", "线长 / B", 76, False), ("info", "摘要", 270, True),
         ])
         timeline.pack(fill="both", expand=True)
+        processes = ttk.Frame(self.notebook, padding=(5, 3))
+        self.notebook.add(processes, text="进程 TCP 流")
+        controls = ttk.Frame(processes)
+        controls.pack(fill="x", pady=(1, 4))
+        ttk.Label(controls, text="本机 PID").pack(side="left", padx=(0, 5))
+        self.pid_box = ttk.Combobox(controls, textvariable=self.pid_var, width=8, state="readonly")
+        self.pid_box.pack(side="left")
+        self.pid_box.bind("<<ComboboxSelected>>", self._refresh_processes)
+        ttk.Button(controls, text="查看包时间线", command=self._open_process_flow).pack(side="right")
+        process_note = ttk.Label(processes, textvariable=self.process_note, anchor="w", wraplength=700)
+        process_note.pack(fill="x", pady=(0, 3))
+        process_table, self.process_tree = _table(processes, [
+            ("id", "流", 48, False), ("a", "端点 A", 185, True), ("a_pid", "PID A", 74, False),
+            ("b", "端点 B", 185, True), ("b_pid", "PID B", 74, False),
+            ("ab", "A→B 包", 70, False), ("ba", "B→A 包", 70, False), ("state", "状态", 95, True),
+        ])
+        process_table.pack(fill="both", expand=True)
+        self.process_tree.bind("<Double-1>", self._open_process_flow)
         status = ttk.Label(body, textvariable=self.status_var, anchor="w", wraplength=700)
         status.grid(row=3, column=0, sticky="ew", pady=(7, 0))
-        for label in (summary, status):
+        for label in (summary, process_note, status):
             label.bind("<Configure>", lambda event: event.widget.configure(wraplength=max(1, event.width - 4)))
 
     def _buttons(self):
@@ -185,6 +209,16 @@ class SnifferApp:
         self.field_tree.delete(*self.field_tree.get_children())
         self.flow_tree.delete(*self.flow_tree.get_children())
         self.flow_var.set("选择一个 TCP 或 HTTP 数据包，查看该连接两个方向的记录。")
+        self.owner_samples = deque(maxlen=8)
+        self.collect_owners = False
+        self.flow_keys = {}
+        self.flow_owners: dict[int, dict[str, int | None]] = {}
+        self.process_rows = {}
+        self.process_tree.delete(*self.process_tree.get_children())
+        self.pid_box.configure(values=())
+        self.pid_var.set("")
+        self.process_note.set("从 Windows 网卡实时抓包时，可按本机 PID 查看已匹配的连接。")
+        self.next_process_refresh = 0.0
         self._counts()
 
     def _counts(self):
@@ -196,8 +230,9 @@ class SnifferApp:
         if self.running or label not in self.sources:
             return
         name = self.sources[label]
+        local_npcap = os.name == "nt" and name.casefold().startswith("\\device\\npf_")
         self._run(lambda stop, callback: capture_live(name, stop, callback),
-                  f"正在抓包　{label}", "抓包已结束")
+                  f"正在抓包　{label}", "抓包已结束", owner_tables=local_npcap)
 
     def open_capture(self, path=None):
         if self.running:
@@ -215,13 +250,17 @@ class SnifferApp:
                 read_pcap(stream, stop, callback)
 
         self._run(reader, f"正在读取　{path.name}", f"读取完成　{path.name}")
+        self.process_note.set("经典 PCAP 没有进程 PID 元数据。此页仅适用于 Windows 本机实时抓包。")
 
-    def _run(self, source, active_text, done_text):
+    def _run(self, source, active_text, done_text, *, owner_tables=False):
         self._reset_session()
         self.stop_event = threading.Event()
         self.running = True
         self._buttons()
         self.status_var.set(active_text)
+        self.collect_owners = owner_tables
+        if owner_tables:
+            self.process_note.set("按 PID 查看已匹配的流。系统快照未观测到的端点显示为“—”。")
         stop = self.stop_event
 
         def put(event, *, final=False):
@@ -232,6 +271,17 @@ class SnifferApp:
                 except queue.Full:
                     continue
             return False
+
+        def sample_owners():
+            while not stop.is_set():
+                begin = time.time()
+                try:
+                    table = read_tcp_owners()
+                except OSError as exc:
+                    put(("owner_error", f"读取系统 TCP 表失败：{exc}"))
+                    return
+                put(("owners", (begin, time.time(), table)))
+                stop.wait(0.30)
 
         def worker():
             count = 0
@@ -246,6 +296,10 @@ class SnifferApp:
                     if count >= PACKET_LIMIT:
                         stop.set()
 
+            sampler = None
+            if owner_tables:
+                sampler = threading.Thread(target=sample_owners, daemon=True, name="tcp-owners")
+                sampler.start()
             try:
                 source(stop, received)
                 if count >= PACKET_LIMIT:
@@ -256,6 +310,10 @@ class SnifferApp:
                     message = done_text
             except Exception as exc:
                 message = f"采集失败：{exc}"
+            finally:
+                stop.set()
+                if sampler is not None:
+                    sampler.join()
             put(("end", message), final=True)
 
         self.worker = threading.Thread(target=worker, daemon=True, name="packet-capture")
@@ -278,17 +336,33 @@ class SnifferApp:
                 self.running = False
                 self._buttons()
                 self.status_var.set(value)
+                self._refresh_processes()
                 break
+            if kind == "owners":
+                self.owner_samples.append(value)
+                for flow_id, key in self.flow_keys.items():
+                    self._match_owners(flow_id, key, (value,))
+                continue
+            if kind == "owner_error":
+                self.process_note.set(value)
+                continue
             self._append(value)
             changed = True
         if changed:
             self._counts()
             if self.selected_flow is not None:
                 self._flow_summary()
+        if self.running and self.flow_owners and time.monotonic() >= self.next_process_refresh:
+            self._refresh_processes()
+            self.next_process_refresh = time.monotonic() + 0.35
         self.timer = self.root.after(35, self._poll)
 
     def _append(self, packet):
         self.tracker.add(packet)
+        if packet.flow_id is not None and self.collect_owners:
+            # FlowTracker defines A as the first observed sender, even midstream.
+            key = self.flow_keys.setdefault(packet.flow_id, (packet.src, packet.sport, packet.dst, packet.dport))
+            self._match_owners(packet.flow_id, key, self.owner_samples)
         self.packets.append(packet)
         number = len(self.packets)
         if packet.matches(self.filter_var.get()):
@@ -347,6 +421,62 @@ class SnifferApp:
         self.flow_tree.insert("", "end", iid=str(number), values=(
             number, _time(packet.timestamp), _endpoint(packet.src, packet.sport),
             _endpoint(packet.dst, packet.dport), packet.length, packet.info))
+
+    def _match_owners(self, flow_id, key, samples):
+        flow = self.tracker.flows[flow_id]
+        for begin, end, table in samples:
+            # Require captured traffic on both sides of the complete table read.
+            # A snapshot belonging to an earlier use of the same tuple cannot qualify.
+            if not flow.first_seen <= begin <= end <= flow.last_seen:
+                continue
+            for side, direction in (("A", key), ("B", key[2:] + key[:2])):
+                pid = table.get(direction)
+                if pid is None:
+                    continue
+                owners = self.flow_owners.setdefault(flow_id, {})
+                if owners.setdefault(side, pid) != pid:
+                    owners[side] = None  # Two owners for one endpoint: keep it unknown.
+
+    def _refresh_processes(self, event=None):
+        pids = sorted({pid for owners in self.flow_owners.values() for pid in owners.values() if pid})
+        self.pid_box.configure(values=pids)
+        chosen = self.pid_var.get()
+        pid = int(chosen) if chosen else None
+        if pid not in pids:
+            pid = pids[0] if pids else None
+            self.pid_var.set(str(pid) if pid is not None else "")
+        rows = {}
+        for flow_id, owners in self.flow_owners.items():
+            if pid is None or pid not in owners.values():
+                continue
+            flow = self.tracker.flows[flow_id]
+            row = (flow.id, flow.endpoint_a, owners.get("A") or "—",
+                   flow.endpoint_b, owners.get("B") or "—",
+                   flow.packets_ab, flow.packets_ba, flow.state)
+            rows[flow_id] = row
+            if flow_id not in self.process_rows:
+                self.process_tree.insert("", "end", iid=str(flow_id), values=row)
+            elif row != self.process_rows[flow_id]:
+                self.process_tree.item(str(flow_id), values=row)
+        for removed in self.process_rows.keys() - rows.keys():
+            self.process_tree.delete(str(removed))
+        self.process_rows = rows
+
+    def _open_process_flow(self, event=None):
+        selection = self.process_tree.selection()
+        if not selection:
+            return
+        flow_id = int(selection[0])
+        numbers = [str(i) for i, pkt in enumerate(self.packets, 1) if pkt.flow_id == flow_id]
+        number = next((n for n in numbers if self.packet_tree.exists(n)), None)
+        if number is None:
+            self.filter_var.set("TCP")
+            self.apply_filter()
+            number = numbers[0]
+        self.packet_tree.selection_set(number)
+        self.packet_tree.see(number)
+        self._selected()
+        self.notebook.select(1)
 
     def close(self):
         if self.closing.is_set():
