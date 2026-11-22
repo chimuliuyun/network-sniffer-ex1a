@@ -4,21 +4,25 @@ from __future__ import annotations
 
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog
 
-from capture import CaptureError, capture_live, list_interfaces, read_pcap
+from capture import CaptureError, CaptureRecord, capture_live, format_hex, list_interfaces, read_pcap, write_pcap
+from local_traffic import capture_demo
 from owners import read_tcp_owners
 from protocols import FlowTracker, Packet, parse_packet
+from ui_layout import build_window
 
 
 PACKET_LIMIT = 5000
-FILTERS = ("全部", "HTTP", "TCP", "UDP", "IPv4", "IPv6", "ICMP", "ICMPv6")
+BYTE_LIMIT = 64 * 1024 * 1024
+SAMPLE_PATH = Path(__file__).resolve().parents[1] / "验收样例" / "本机回环.pcap"
 
 
 def _is_loopback(name: str) -> bool:
@@ -37,22 +41,12 @@ def _endpoint(address: str, port: int | None) -> str:
     return f"{address}:{port}"
 
 
-def _table(parent, columns):
-    frame = ttk.Frame(parent)
-    frame.rowconfigure(0, weight=1)
-    frame.columnconfigure(0, weight=1)
-    tree = ttk.Treeview(frame, columns=[c[0] for c in columns],
-                        show="headings", selectmode="browse")
-    for key, title, width, stretch in columns:
-        tree.heading(key, text=title, anchor="w")
-        tree.column(key, width=width, minwidth=40, stretch=stretch)
-    vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-    horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-    tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-    tree.grid(row=0, column=0, sticky="nsew")
-    vertical.grid(row=0, column=1, sticky="ns")
-    horizontal.grid(row=1, column=0, sticky="ew")
-    return frame, tree
+def _format_size(size: int) -> str:
+    if size < 1024:
+        return f"{size:,} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size / (1024 * 1024):.1f} MiB"
 
 
 class SnifferApp:
@@ -60,6 +54,7 @@ class SnifferApp:
         self.root = root
         self.sources: dict[str, str] = {}
         self.packets: list[Packet] = []
+        self.records: list[CaptureRecord] = []
         self.tracker = FlowTracker()
         self.running = False
         self.worker: threading.Thread | None = None
@@ -71,98 +66,27 @@ class SnifferApp:
         self.source_name = tk.StringVar(root)
         self.filter_var = tk.StringVar(root, "全部")
         self.status_var = tk.StringVar(root)
-        self.count_var = tk.StringVar(root)
         self.flow_var = tk.StringVar(root)
         self.pid_var = tk.StringVar(root)
         self.process_note = tk.StringVar(root)
-        self._build()
+        self.query_var = tk.StringVar(root)
+        self.mode_var = tk.StringVar(root, "就绪")
+        self.session_var = tk.StringVar(root, "等待开始采集")
+        self.total_var = tk.StringVar(root)
+        self.visible_var = tk.StringVar(root)
+        self.streams_var = tk.StringVar(root)
+        self.bytes_var = tk.StringVar(root)
+        self.selected_var = tk.StringVar(root)
+        self.flow_choice_var = tk.StringVar(root)
+        self.filter_timer = None
+        build_window(self)
+        self.flow_tree.bind("<Double-1>", self.inspect_flow_packet)
+        self.flow_tree.bind("<Return>", self.inspect_flow_packet)
+        self.query_var.trace_add("write", self.schedule_filter)
         self._reset_session()
         self.refresh_interfaces()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.timer = self.root.after(40, self._poll)
-
-    def _build(self):
-        root = self.root
-        root.title("网络嗅探器 · 实验 1A")
-        root.geometry("1100x740")
-        root.minsize(760, 550)
-        body = ttk.Frame(root, padding=(14, 12))
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(2, weight=1)
-
-        bar = ttk.Frame(body)
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        bar.columnconfigure(1, weight=1)
-        ttk.Label(bar, text="抓包接口").grid(row=0, column=0, padx=(0, 7))
-        self.source_box = ttk.Combobox(bar, textvariable=self.source_name, state="readonly")
-        self.source_box.grid(row=0, column=1, sticky="ew")
-        self.refresh_button = ttk.Button(bar, text="刷新接口", command=self.refresh_interfaces)
-        self.refresh_button.grid(row=0, column=2, padx=(6, 12))
-        self.start_button = ttk.Button(bar, text="开始抓包", command=self.start_capture)
-        self.start_button.grid(row=0, column=3)
-        self.stop_button = ttk.Button(bar, text="停止", command=self.stop_capture)
-        self.stop_button.grid(row=0, column=4, padx=6)
-        self.open_button = ttk.Button(bar, text="打开 PCAP…", command=self.open_capture)
-        self.open_button.grid(row=0, column=5)
-
-        filters = ttk.Frame(body)
-        filters.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(filters, text="协议筛选").pack(side="left", padx=(0, 7))
-        self.filter_box = ttk.Combobox(filters, textvariable=self.filter_var, values=FILTERS,
-                                       width=12, state="readonly")
-        self.filter_box.pack(side="left")
-        self.filter_box.bind("<<ComboboxSelected>>", self.apply_filter)
-        ttk.Label(filters, textvariable=self.count_var).pack(side="right")
-
-        split = ttk.Panedwindow(body, orient="vertical")
-        split.grid(row=2, column=0, sticky="nsew")
-        listing, self.packet_tree = _table(split, [
-            ("number", "序号", 55, False), ("time", "时间", 110, False),
-            ("src", "源地址", 155, True), ("dst", "目的地址", 155, True),
-            ("protocol", "协议", 72, False), ("length", "线长 / B", 76, False),
-            ("info", "摘要", 310, True),
-        ])
-        split.add(listing, weight=3)
-        self.packet_tree.bind("<<TreeviewSelect>>", self._selected)
-        self.notebook = ttk.Notebook(split)
-        split.add(self.notebook, weight=2)
-        fields, self.field_tree = _table(self.notebook, [
-            ("name", "字段", 210, False), ("value", "解析结果", 680, True),
-        ])
-        self.notebook.add(fields, text="字段解析")
-        flow = ttk.Frame(self.notebook, padding=(5, 3))
-        self.notebook.add(flow, text="TCP 流追踪")
-        summary = ttk.Label(flow, textvariable=self.flow_var, justify="left", wraplength=700)
-        summary.pack(fill="x", pady=(1, 4))
-        timeline, self.flow_tree = _table(flow, [
-            ("number", "包序号", 60, False), ("time", "时间", 110, False),
-            ("src", "源端点", 175, True), ("dst", "目的端点", 175, True),
-            ("length", "线长 / B", 76, False), ("info", "摘要", 270, True),
-        ])
-        timeline.pack(fill="both", expand=True)
-        processes = ttk.Frame(self.notebook, padding=(5, 3))
-        self.notebook.add(processes, text="进程 TCP 流")
-        controls = ttk.Frame(processes)
-        controls.pack(fill="x", pady=(1, 4))
-        ttk.Label(controls, text="本机 PID").pack(side="left", padx=(0, 5))
-        self.pid_box = ttk.Combobox(controls, textvariable=self.pid_var, width=8, state="readonly")
-        self.pid_box.pack(side="left")
-        self.pid_box.bind("<<ComboboxSelected>>", self._refresh_processes)
-        ttk.Button(controls, text="查看包时间线", command=self._open_process_flow).pack(side="right")
-        process_note = ttk.Label(processes, textvariable=self.process_note, anchor="w", wraplength=700)
-        process_note.pack(fill="x", pady=(0, 3))
-        process_table, self.process_tree = _table(processes, [
-            ("id", "流", 48, False), ("a", "端点 A", 185, True), ("a_pid", "PID A", 74, False),
-            ("b", "端点 B", 185, True), ("b_pid", "PID B", 74, False),
-            ("ab", "A→B 包", 70, False), ("ba", "B→A 包", 70, False), ("state", "状态", 95, True),
-        ])
-        process_table.pack(fill="both", expand=True)
-        self.process_tree.bind("<Double-1>", self._open_process_flow)
-        status = ttk.Label(body, textvariable=self.status_var, anchor="w", wraplength=700)
-        status.grid(row=3, column=0, sticky="ew", pady=(7, 0))
-        for label in (summary, process_note, status):
-            label.bind("<Configure>", lambda event: event.widget.configure(wraplength=max(1, event.width - 4)))
 
     def _buttons(self):
         self.source_box.configure(state="disabled" if self.running else "readonly")
@@ -170,6 +94,10 @@ class SnifferApp:
         self.start_button.configure(state="normal" if self.sources and not self.running else "disabled")
         self.stop_button.configure(state="normal" if self.running else "disabled")
         self.open_button.configure(state="disabled" if self.running else "normal")
+        self.sample_button.configure(state="disabled" if self.running else "normal")
+        self.export_button.configure(state="normal" if self.records and not self.running else "disabled")
+        demo_ready = any(_is_loopback(name) for name in self.sources.values())
+        self.demo_button.configure(state="normal" if demo_ready and not self.running else "disabled")
 
     def refresh_interfaces(self):
         if self.running:
@@ -202,6 +130,12 @@ class SnifferApp:
 
     def _reset_session(self):
         self.packets.clear()
+        self.records.clear()
+        self.wire_bytes = 0
+        self.flow_labels = {}
+        self.flow_options_count = 0
+        self.flow_choice_var.set("")
+        self.flow_box.configure(values=())
         self.tracker = FlowTracker()
         self.selected_flow = None
         self.displayed = 0
@@ -219,11 +153,25 @@ class SnifferApp:
         self.pid_var.set("")
         self.process_note.set("从 Windows 网卡实时抓包时，可按本机 PID 查看已匹配的连接。")
         self.next_process_refresh = 0.0
+        self._selected()
         self._counts()
 
     def _counts(self):
-        self.count_var.set(f"已记录 {len(self.packets):,} 包　显示 {self.displayed:,} 包　"
-                           f"TCP 流 {len(self.tracker.flows):,} 条")
+        self.total_var.set(f"{len(self.packets):,}")
+        self.visible_var.set(f"{self.displayed:,}")
+        self.streams_var.set(f"{len(self.tracker.flows):,}")
+        self.bytes_var.set(_format_size(self.wire_bytes))
+        if self.displayed:
+            self.empty_panel.place_forget()
+        else:
+            if self.packets:
+                hint = "没有匹配的数据包。可清空搜索或切换协议。"
+            elif self.running:
+                hint = "正在等待数据包…"
+            else:
+                hint = "点击「开始抓包」，或打开实验样例。"
+            self.empty_var.set(hint)
+            self.empty_panel.place(relx=.5, rely=.48, anchor="center")
 
     def start_capture(self):
         label = self.source_name.get()
@@ -232,9 +180,26 @@ class SnifferApp:
         name = self.sources[label]
         local_npcap = os.name == "nt" and name.casefold().startswith("\\device\\npf_")
         self._run(lambda stop, callback: capture_live(name, stop, callback),
-                  f"正在抓包　{label}", "抓包已结束", owner_tables=local_npcap)
+                  mode="实时抓包", source_name=label, owner_tables=local_npcap)
 
-    def open_capture(self, path=None):
+    def start_demo(self):
+        if self.running:
+            return
+        label = next((k for k, name in self.sources.items() if _is_loopback(name)), None)
+        if label is None:
+            self.status_var.set("没有找到本机回环接口，请检查 Npcap 后刷新。")
+            return
+        self.source_name.set(label)
+        self.filter_var.set("全部")
+        self.query_var.set("")
+        name = self.sources[label]
+        self._run(lambda stop, callback: capture_demo(name, stop, callback),
+                  mode="回环实测", source_name=f"本机回环 · PID {os.getpid()}", owner_tables=os.name == "nt")
+
+    def open_sample(self):
+        self.open_capture(SAMPLE_PATH, sample=True)
+
+    def open_capture(self, path=None, *, sample=False):
         if self.running:
             return
         if path is None:
@@ -249,16 +214,37 @@ class SnifferApp:
             with path.open("rb") as stream:
                 read_pcap(stream, stop, callback)
 
-        self._run(reader, f"正在读取　{path.name}", f"读取完成　{path.name}")
-        self.process_note.set("经典 PCAP 没有进程 PID 元数据。此页仅适用于 Windows 本机实时抓包。")
+        self._run(reader, mode="实验样例" if sample else "离线文件", source_name=path.name, offline=True)
 
-    def _run(self, source, active_text, done_text, *, owner_tables=False):
-        self._reset_session()
+    def export_capture(self, path=None):
+        if self.running or not self.records:
+            return
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                parent=self.root, title="导出完整会话", defaultextension=".pcap",
+                initialfile=f"网络抓包_{datetime.now():%Y%m%d_%H%M%S}.pcap",
+                filetypes=[("经典 PCAP", "*.pcap")])
+        if not path:
+            return
+        try:
+            write_pcap(path, self.records)
+        except (CaptureError, OSError) as exc:
+            self.status_var.set(f"导出失败 · {exc}")
+        else:
+            self.status_var.set(f"已导出 {len(self.records):,} 包 · {path}")
+
+    def _run(self, source, *, mode, source_name, owner_tables=False, offline=False):
+        if not offline:
+            self._reset_session()
+            self.mode_var.set(mode)
+            self.session_var.set(source_name)
         self.stop_event = threading.Event()
         self.running = True
         self._buttons()
-        self.status_var.set(active_text)
-        self.collect_owners = owner_tables
+        self.status_var.set(f"正在读取 {source_name}…" if offline else f"{mode}进行中…")
+        if not offline:
+            self.collect_owners = owner_tables
+        self._counts()
         if owner_tables:
             self.process_note.set("按 PID 查看已匹配的流。系统快照未观测到的端点显示为“—”。")
         stop = self.stop_event
@@ -285,16 +271,29 @@ class SnifferApp:
 
         def worker():
             count = 0
+            raw_bytes = 0
+            limit_message = ""
+            pending = []
 
             def received(timestamp, datalink, data, wirelen):
-                nonlocal count
+                nonlocal count, raw_bytes, limit_message
                 if stop.is_set():
                     return
+                if raw_bytes + len(data) > BYTE_LIMIT:
+                    limit_message = "原始包已达单次内存上限 64 MiB，采集已停止。"
+                    stop.set()
+                    return
+                record = CaptureRecord(timestamp, datalink, data, wirelen)
                 packet = parse_packet(timestamp, datalink, data, wirelen)
-                if put(("packet", packet)):
-                    count += 1
-                    if count >= PACKET_LIMIT:
-                        stop.set()
+                if offline:
+                    pending.append((packet, record))
+                elif not put(("packet", (packet, record))):
+                    return
+                count += 1
+                raw_bytes += len(data)
+                if count >= PACKET_LIMIT:
+                    limit_message = f"已达到单次记录上限 {PACKET_LIMIT:,} 包，采集已停止。"
+                    stop.set()
 
             sampler = None
             if owner_tables:
@@ -302,14 +301,16 @@ class SnifferApp:
                 sampler.start()
             try:
                 source(stop, received)
-                if count >= PACKET_LIMIT:
-                    message = f"已达到单次记录上限 {PACKET_LIMIT:,} 包，采集已停止。"
+                if offline and (limit_message or not stop.is_set()):
+                    put(("loaded", (mode, source_name, pending)), final=True)
+                if limit_message:
+                    message = limit_message
                 elif stop.is_set():
-                    message = "已停止。"
+                    message = "已取消读取" if offline else "已停止采集"
                 else:
-                    message = done_text
+                    message = f"{mode}完成 · {count:,} 包"
             except Exception as exc:
-                message = f"采集失败：{exc}"
+                message = f"{'打开失败' if offline else '采集失败'} · {exc}"
             finally:
                 stop.set()
                 if sampler is not None:
@@ -337,19 +338,36 @@ class SnifferApp:
                 self._buttons()
                 self.status_var.set(value)
                 self._refresh_processes()
+                self._counts()
+                self._select_default()
                 break
             if kind == "owners":
                 self.owner_samples.append(value)
                 for flow_id, key in self.flow_keys.items():
                     self._match_owners(flow_id, key, (value,))
                 continue
+            if kind == "loaded":
+                mode, name, packets = value
+                self._reset_session()
+                self.filter_var.set("全部")
+                self.query_var.set("")
+                self.mode_var.set(mode)
+                self.session_var.set(name)
+                self.process_note.set("经典 PCAP 没有进程 PID 元数据。可在回环实测或实时抓包时查看进程。")
+                for packet, record in packets:
+                    self._append(packet, record)
+                changed = True
+                continue
             if kind == "owner_error":
                 self.process_note.set(value)
                 continue
-            self._append(value)
+            self._append(*value)
             changed = True
         if changed:
             self._counts()
+            if len(self.flow_labels) != self.flow_options_count:
+                self.flow_box.configure(values=tuple(self.flow_labels))
+                self.flow_options_count = len(self.flow_labels)
             if self.selected_flow is not None:
                 self._flow_summary()
         if self.running and self.flow_owners and time.monotonic() >= self.next_process_refresh:
@@ -357,46 +375,94 @@ class SnifferApp:
             self.next_process_refresh = time.monotonic() + 0.35
         self.timer = self.root.after(35, self._poll)
 
-    def _append(self, packet):
+    def _append(self, packet, record):
+        self.records.append(record)
+        self.wire_bytes += packet.length
         self.tracker.add(packet)
+        if packet.flow_id is not None and len(self.flow_labels) < len(self.tracker.flows):
+            flow = self.tracker.flows[packet.flow_id]
+            self.flow_labels[f"#{flow.id}   {flow.endpoint_a}  ↔  {flow.endpoint_b}"] = flow.id
         if packet.flow_id is not None and self.collect_owners:
             # FlowTracker defines A as the first observed sender, even midstream.
             key = self.flow_keys.setdefault(packet.flow_id, (packet.src, packet.sport, packet.dst, packet.dport))
             self._match_owners(packet.flow_id, key, self.owner_samples)
         self.packets.append(packet)
         number = len(self.packets)
-        if packet.matches(self.filter_var.get()):
+        if self._matches(packet):
             self._insert_packet(number, packet)
         if packet.flow_id is not None and packet.flow_id == self.selected_flow:
             self._insert_flow(number, packet)
 
     def _insert_packet(self, number, packet):
-        self.packet_tree.insert("", "end", iid=str(number), values=(
-            number, _time(packet.timestamp), packet.src, packet.dst,
+        self.packet_tree.insert("", "end", iid=str(number), tags=(packet.protocol,), values=(
+            number, _time(packet.timestamp), _endpoint(packet.src, packet.sport), _endpoint(packet.dst, packet.dport),
             packet.protocol, packet.length, packet.info))
         self.displayed += 1
 
+    def _matches(self, packet):
+        if not packet.matches(self.filter_var.get()):
+            return False
+        words = self.query_var.get().casefold().split()
+        if not words:
+            return True
+        text = " ".join((_endpoint(packet.src, packet.sport), _endpoint(packet.dst, packet.dport),
+                         *packet.layers, packet.info)).casefold()
+        return all(word in text for word in words)
+
+    def schedule_filter(self, *_):
+        if self.filter_timer is not None:
+            self.root.after_cancel(self.filter_timer)
+        self.filter_timer = self.root.after(130, self.apply_filter)
+
     def apply_filter(self, event=None):
+        if self.filter_timer is not None:
+            self.root.after_cancel(self.filter_timer)
+            self.filter_timer = None
         previous = self.packet_tree.selection()
         self.packet_tree.delete(*self.packet_tree.get_children())
         self.displayed = 0
-        selected_filter = self.filter_var.get()
         for number, packet in enumerate(self.packets, 1):
-            if packet.matches(selected_filter):
+            if self._matches(packet):
                 self._insert_packet(number, packet)
         if previous and self.packet_tree.exists(previous[0]):
             self.packet_tree.selection_set(previous[0])
             self.packet_tree.see(previous[0])
+        elif self.displayed:
+            self._select_default()
         self._selected()
         self._counts()
+
+    def _select_default(self):
+        if self.packet_tree.selection():
+            return
+        rows = self.packet_tree.get_children()
+        if rows:
+            number = next((i for i in rows if self.packets[int(i) - 1].protocol == "HTTP"), rows[0])
+            self.packet_tree.selection_set(number)
+            self.packet_tree.see(number)
+            if number in rows[:5]:
+                self.packet_tree.yview_moveto(0)
+            self._selected()
 
     def _selected(self, event=None):
         selection = self.packet_tree.selection()
         self.field_tree.delete(*self.field_tree.get_children())
         packet = self.packets[int(selection[0]) - 1] if selection else None
+        self.hex_text.configure(state="normal")
+        self.hex_text.delete("1.0", "end")
         if packet is not None:
-            for field, value in packet.details.items():
+            self.selected_var.set(f"#{selection[0]}   {'  /  '.join(packet.layers)}")
+            raw = self.records[int(selection[0]) - 1].data
+            self.hex_text.insert("1.0", format_hex(raw))
+            # Keep the selected protocol's own fields above the lower layers.
+            fields = sorted(packet.details, key=lambda key: (
+                not key.startswith(packet.protocol), key not in ("源端口", "目的端口", "源 IP", "目的 IP")))
+            for field in fields:
+                value = packet.details[field]
                 self.field_tree.insert("", "end", values=(field, value))
+        else:
+            self.selected_var.set("尚未选中数据包")
+        self.hex_text.configure(state="disabled")
         flow_id = packet.flow_id if packet else None
         if flow_id != self.selected_flow:
             self.selected_flow = flow_id
@@ -405,6 +471,7 @@ class SnifferApp:
                 for number, other in enumerate(self.packets, 1):
                     if other.flow_id == flow_id:
                         self._insert_flow(number, other)
+        self.flow_choice_var.set(next((name for name, fid in self.flow_labels.items() if fid == flow_id), ""))
         self._flow_summary()
 
     def _flow_summary(self):
@@ -466,10 +533,32 @@ class SnifferApp:
         selection = self.process_tree.selection()
         if not selection:
             return
-        flow_id = int(selection[0])
+        self._show_flow(int(selection[0]))
+
+    def choose_flow(self, event=None):
+        choice = self.flow_labels.get(self.flow_choice_var.get())
+        if choice is not None:
+            self._show_flow(choice)
+
+    def inspect_flow_packet(self, event=None):
+        selected = self.flow_tree.selection()
+        if not selected:
+            return
+        number = selected[0]
+        if not self.packet_tree.exists(number):
+            self.query_var.set("")
+            self.filter_var.set("TCP")
+            self.apply_filter()
+        self.packet_tree.selection_set(number)
+        self.packet_tree.see(number)
+        self._selected()
+        self.notebook.select(0)
+
+    def _show_flow(self, flow_id):
         numbers = [str(i) for i, pkt in enumerate(self.packets, 1) if pkt.flow_id == flow_id]
         number = next((n for n in numbers if self.packet_tree.exists(n)), None)
         if number is None:
+            self.query_var.set("")
             self.filter_var.set("TCP")
             self.apply_filter()
             number = numbers[0]
@@ -484,6 +573,8 @@ class SnifferApp:
         self.closing.set()
         self.stop_event.set()
         self.root.after_cancel(self.timer)
+        if self.filter_timer is not None:
+            self.root.after_cancel(self.filter_timer)
         self.root.withdraw()
         self._finish_close()
 
@@ -496,5 +587,9 @@ class SnifferApp:
 
 if __name__ == "__main__":
     window = tk.Tk()
-    SnifferApp(window)
+    app = SnifferApp(window)
+    if len(sys.argv) == 2 and sys.argv[1] != "--sample":
+        window.after_idle(app.open_capture, sys.argv[1])
+    elif SAMPLE_PATH.is_file():
+        window.after_idle(app.open_sample)
     window.mainloop()

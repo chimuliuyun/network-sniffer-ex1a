@@ -4,6 +4,7 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event
 from unittest.mock import Mock, patch
 
@@ -18,6 +19,45 @@ def pcap_bytes(endian="<", magic=0xA1B2C3D4, fraction=250000, original=8):
 
 
 class ClassicPcapTests(unittest.TestCase):
+    def test_export_sample_and_truncated_record_roundtrip(self):
+        def records(path):
+            result = []
+            with path.open("rb") as stream:
+                capture.read_pcap(stream, Event(), lambda *args: result.append(capture.CaptureRecord(*args)))
+            return result
+
+        sample = Path(__file__).resolve().parents[1] / "验收样例" / "本机回环.pcap"
+        original = records(sample)
+        self.assertTrue(original)
+        original.append(capture.CaptureRecord(12.000000123, original[0].datalink, b"ab", 42))
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "export.pcap"
+            capture.write_pcap(path, iter(original))
+            self.assertEqual(records(path), original)
+
+    def test_export_failure_preserves_existing_target(self):
+        good = capture.CaptureRecord(12.25, 1, b"bytes", 5)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "existing.pcap"
+            path.write_bytes(b"old contents")
+            for invalid in ([], [good, capture.CaptureRecord(12.3, 0, b"a", 1)],
+                            [good, capture.CaptureRecord(12.3, 1, b"abcd", 2)],
+                            [good, capture.CaptureRecord(float("nan"), 1, b"a", 1)]):
+                with self.subTest(invalid=invalid), self.assertRaises(capture.CaptureError):
+                    capture.write_pcap(path, invalid)
+                self.assertEqual(path.read_bytes(), b"old contents")
+                self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_hex_offsets_ascii_and_display_limit(self):
+        data = b"A\x00\xffz" + bytes(range(12)) + b"XY"
+        rows = capture.format_hex(data, 17).splitlines()
+        self.assertTrue(rows[0].startswith("0000  41 00 FF 7A"))
+        self.assertTrue(rows[0].endswith("|A..z............|"))
+        self.assertTrue(rows[1].startswith("0010  58 "))
+        self.assertTrue(rows[1].endswith("|X|"))
+        self.assertIn("17 / 18", rows[2])
+        self.assertEqual(len(capture.format_hex(data, 18).splitlines()), 2)
+
     def test_both_byte_orders_and_timestamp_resolutions(self):
         for endian in ("<", ">"):
             for magic, frac in ((0xA1B2C3D4, 250000), (0xA1B23C4D, 250000000)):

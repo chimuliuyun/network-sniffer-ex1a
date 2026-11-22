@@ -154,7 +154,7 @@ def _ip_payload(packet: Packet, ether_type: int, data: bytes) -> tuple[int, byte
 
 
 # Match a complete HTTP/1.x start line, regardless of the service port.
-_REQUEST = re.compile(rb"([!#$%&'*+.^_`|~0-9A-Za-z-]+) [^\x00-\x20\x7f]+ (HTTP/1\.[01])")
+_REQUEST = re.compile(rb"([!#$%&'*+.^_`|~0-9A-Za-z-]+) ([^\x00-\x20\x7f]+) (HTTP/1\.[01])")
 _RESPONSE = re.compile(rb"(HTTP/1\.[01]) ([1-5][0-9]{2}) [^\x00-\x08\x0a-\x1f\x7f]*")
 _FLAGS = ((0x01, "FIN"), (0x02, "SYN"), (0x04, "RST"), (0x08, "PSH"),
           (0x10, "ACK"), (0x20, "URG"), (0x40, "ECE"), (0x80, "CWR"))
@@ -185,9 +185,9 @@ def _parse_transport(packet: Packet, proto: int, data: bytes, more: bool) -> Non
             if request or response:
                 packet.layers += ("HTTP",)
                 if request:
-                    method, version = (part.decode("ascii") for part in request.groups())
-                    packet.info = f"{method}  {version}"
-                    packet.details.update({"HTTP 方法": method, "HTTP 版本": version})
+                    method, target, version = (part.decode("ascii", "replace") for part in request.groups())
+                    packet.info = f"{method} {target[:160]}  {version}"
+                    packet.details.update({"HTTP 方法": method, "HTTP 请求目标": target, "HTTP 版本": version})
                 else:
                     version, status = (part.decode("ascii") for part in response.groups())
                     packet.info = f"{version}  {status}"

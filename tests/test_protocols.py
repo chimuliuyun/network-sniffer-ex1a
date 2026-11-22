@@ -42,6 +42,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(p.matches(layer))
         self.assertFalse(p.matches("UDP"))
         self.assertEqual((p.sport, p.dport, p.details["HTTP 方法"]), (52001, 8088, "GET"))
+        self.assertEqual(p.details["HTTP 请求目标"], "/demo")
         self.assertEqual(p.details["VLAN ID（由外到内）"], "77 → 42")
         reply = parse_packet(2, 101, ipv4(6, tcp(b"HTTP/1.1 200 OK\r\n")))
         self.assertEqual(reply.details["HTTP 状态码"], "200")
